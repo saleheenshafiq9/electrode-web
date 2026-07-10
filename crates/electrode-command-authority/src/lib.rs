@@ -10,6 +10,7 @@ mod firmware;
 mod firmware_gate;
 mod policy;
 mod runtime;
+mod velocity_budget;
 
 pub use policy::{
     AuthorizedCommand, CommandPolicy, Delivery, PolicyConfig, PolicyError,

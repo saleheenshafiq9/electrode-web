@@ -14,6 +14,7 @@ use zenoh::{Session, Wait};
 
 use crate::firmware_gate::{publish_policy_rejection, FirmwareGate};
 use crate::policy::{AuthorizedCommand, CommandPolicy, Delivery, PolicyConfig};
+use crate::velocity_budget::BudgetState;
 
 const PARAMETER_QUEUE_CAPACITY: usize = 8;
 const PRIVATE_MOCAP_TOPIC: &str = "electrode/sim/rumoca/mocap_frame";
@@ -76,13 +77,21 @@ impl CommandAuthorityConfig {
                     "ELECTRODE_GCS_FIRMWARE_KEY_PREFIX",
                     defaults.policy.firmware_key_prefix,
                 ),
-                device: value_or("ELECTRODE_GCS_DEVICE", defaults.policy.device),
                 velocity_min_mps: 1.0,
                 velocity_max_mps: 4.0,
                 velocity_budget: env::var("ELECTRODE_GCS_VELOCITY_BUDGET")
                     .ok()
                     .and_then(|value| value.parse().ok())
-                    .unwrap_or(defaults.policy.velocity_budget),
+                    .unwrap_or(defaults.policy.velocity_budget)
+                    .clamp(1, 5),
+                velocity_budget_json: path_or(
+                    "ELECTRODE_GCS_VELOCITY_BUDGET_DB",
+                    defaults.policy.velocity_budget_json,
+                ),
+                velocity_budget_csv: path_or(
+                    "ELECTRODE_GCS_VELOCITY_BUDGET_CSV",
+                    defaults.policy.velocity_budget_csv,
+                ),
                 raw_max_bytes: defaults.policy.raw_max_bytes,
             },
         }
@@ -133,6 +142,9 @@ impl CommandAuthority {
                         ),
                         Delivery::Publish => {
                             tracing::error!("publish command reached query worker")
+                        }
+                        Delivery::Budget => {
+                            tracing::error!("budget command reached query worker")
                         }
                     }
                 }
@@ -219,6 +231,15 @@ fn subscribe_intents(
                         command,
                     );
                 }
+                Ok(command) if command.delivery == Delivery::Budget => {
+                    publish_velocity_command_status(
+                        &callback_browser,
+                        &callback_config,
+                        "state",
+                        &command,
+                        "authoritative velocity budget",
+                    );
+                }
                 Ok(command) => {
                     enqueue_query(&query_sender, &callback_browser, &callback_config, command)
                 }
@@ -229,6 +250,7 @@ fn subscribe_intents(
                         &callback_config,
                         policy.as_ref(),
                         intent_key,
+                        &payload,
                         &error.to_string(),
                     );
                 }
@@ -243,18 +265,23 @@ fn publish_policy_error(
     config: &CommandAuthorityConfig,
     policy: &CommandPolicy,
     intent_key: &str,
+    payload: &[u8],
     message: &str,
 ) {
     let prefix = format!("{}/", config.policy.intent_prefix.trim_end_matches('/'));
     let suffix = intent_key.strip_prefix(&prefix).unwrap_or("");
     match suffix {
-        "velocity" => publish_velocity_status(
-            browser,
-            config,
-            "rejected",
-            policy.velocity_remaining(&config.policy.device),
-            message,
-        ),
+        "velocity" | "velocity_budget" | "raw/local_position_command" => {
+            match policy.velocity_state_for_payload(payload) {
+                Ok(state) => publish_velocity_status(browser, config, "rejected", &state, message),
+                Err(_) => publish_unknown_velocity_status(
+                    browser,
+                    config,
+                    CommandPolicy::credential_id_for_payload(payload).as_deref(),
+                    message,
+                ),
+            }
+        }
         "gain" => publish_status(browser, config, "gain", "rejected", message),
         firmware if firmware.starts_with("firmware/") => {
             let update_id = firmware[9..].split('/').next().unwrap_or("");
@@ -274,17 +301,24 @@ fn execute_publish(
     policy: &CommandPolicy,
     command: AuthorizedCommand,
 ) {
-    let result = vehicle.put(&command.target, command.payload).wait();
+    let result = vehicle.put(&command.target, command.payload.clone()).wait();
     if let Err(error) = result {
-        if let Some(device) = command.velocity_device.as_deref() {
-            policy.refund_velocity(device);
-            publish_velocity_status(
-                browser,
-                config,
-                "failed",
-                policy.velocity_remaining(device),
-                &error.to_string(),
-            );
+        if let (Some(device), Some(credential_id)) = (
+            command.velocity_device.as_deref(),
+            command.velocity_credential_id.as_deref(),
+        ) {
+            match policy.refund_velocity(device, credential_id) {
+                Ok(state) => {
+                    publish_velocity_status(browser, config, "failed", &state, &error.to_string())
+                }
+                Err(refund_error) => publish_velocity_command_status(
+                    browser,
+                    config,
+                    "failed",
+                    &command,
+                    &format!("{error}; velocity budget refund failed: {refund_error}"),
+                ),
+            }
         } else {
             publish_status(
                 browser,
@@ -296,12 +330,12 @@ fn execute_publish(
         }
         return;
     }
-    if let Some(remaining) = command.velocity_remaining {
-        publish_velocity_status(
+    if command.velocity_remaining.is_some() {
+        publish_velocity_command_status(
             browser,
             config,
             "accepted",
-            remaining,
+            &command,
             "command forwarded to the vehicle session",
         );
     } else {
@@ -480,18 +514,97 @@ fn publish_velocity_status(
     browser: &Session,
     config: &CommandAuthorityConfig,
     status: &str,
-    remaining: u32,
+    state: &BudgetState,
     message: &str,
 ) {
+    publish_velocity_status_fields(
+        browser,
+        config,
+        status,
+        Some(&state.device_id),
+        Some(&state.credential_id),
+        state.limit,
+        state.used,
+        state.remaining,
+        Some(&state.budget_version),
+        message,
+    );
+}
+
+fn publish_velocity_command_status(
+    browser: &Session,
+    config: &CommandAuthorityConfig,
+    status: &str,
+    command: &AuthorizedCommand,
+    message: &str,
+) {
+    publish_velocity_status_fields(
+        browser,
+        config,
+        status,
+        command.velocity_device.as_deref(),
+        command.velocity_credential_id.as_deref(),
+        command
+            .velocity_limit
+            .unwrap_or(config.policy.velocity_budget.clamp(1, 5)),
+        command
+            .velocity_used
+            .unwrap_or(config.policy.velocity_budget),
+        command.velocity_remaining.unwrap_or(0),
+        command.velocity_budget_version.as_deref(),
+        message,
+    );
+}
+
+fn publish_unknown_velocity_status(
+    browser: &Session,
+    config: &CommandAuthorityConfig,
+    credential_id: Option<&str>,
+    message: &str,
+) {
+    publish_velocity_status_fields(
+        browser,
+        config,
+        "rejected",
+        None,
+        credential_id,
+        config.policy.velocity_budget.clamp(1, 5),
+        config.policy.velocity_budget.clamp(1, 5),
+        0,
+        None,
+        message,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_velocity_status_fields(
+    browser: &Session,
+    config: &CommandAuthorityConfig,
+    status: &str,
+    device_id: Option<&str>,
+    credential_id: Option<&str>,
+    limit: u32,
+    used: u32,
+    remaining: u32,
+    budget_version: Option<&str>,
+    message: &str,
+) {
+    let credential_suffix = credential_id
+        .map(|value| format!("/{value}"))
+        .unwrap_or_default();
     let key = format!(
-        "{}/status/velocity",
-        status_prefix(&config.policy.intent_prefix)
+        "{}/status/velocity{credential_suffix}",
+        status_prefix(&config.policy.intent_prefix),
     );
     let payload = serde_json::json!({
         "status": status,
         "message": message,
-        "limit": config.policy.velocity_budget,
+        "deviceId": device_id,
+        "credentialId": credential_id,
+        "limit": limit,
+        "used": used,
         "remaining": remaining,
+        "budgetVersion": budget_version,
     })
     .to_string();
     if let Err(error) = browser.put(key.clone(), payload).wait() {
@@ -532,6 +645,10 @@ fn optional(key: &str) -> Option<String> {
 
 fn value_or(key: &str, default: String) -> String {
     optional(key).unwrap_or(default)
+}
+
+fn path_or(key: &str, default: std::path::PathBuf) -> std::path::PathBuf {
+    optional(key).map_or(default, std::path::PathBuf::from)
 }
 
 #[cfg(test)]

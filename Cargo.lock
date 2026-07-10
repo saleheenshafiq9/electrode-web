@@ -694,6 +694,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "flatbuffers",
+ "serde",
  "serde_json",
  "sha2",
  "synapse_fbs",
